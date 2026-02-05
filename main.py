@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-Cloud Relay Server - Bridges cameras and website across different networks
-
-This server should be hosted on a cloud service (AWS, DigitalOcean, etc.)
-with a public IP that both the Raspberry Pi and the website can access.
+Cloud Relay Server - Push-based video streaming for cameras behind NAT
 
 Architecture:
+- Cameras PUSH video frames to this relay via HTTP POST
 - Cameras POST alarm triggers to this relay
-- Cameras stream video through this relay (or direct if using public URL)
 - Website polls this relay for alarm status
-- Website fetches video streams from this relay (or direct from cameras)
+- Website fetches video streams from this relay's buffer
 """
 
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
-import requests
 import time
-from collections import defaultdict
+from collections import deque
 import threading
 
 app = Flask(__name__)
@@ -30,12 +26,13 @@ alarm_states = {
     4: {'active': False, 'last_update': 0}
 }
 
-# Store video stream URLs for each camera (cameras register themselves)
-camera_streams = {
-    1: None,
-    2: None,
-    3: None,
-    4: None
+# Store latest video frames for each camera (in-memory buffer)
+# Using deque with maxlen=1 to only keep the most recent frame
+camera_frames = {
+    1: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
+    2: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
+    3: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
+    4: {'frame': None, 'last_update': 0, 'lock': threading.Lock()}
 }
 
 # Latest command for polling
@@ -46,14 +43,27 @@ command_lock = threading.Lock()
 # CAMERA ENDPOINTS (Cameras call these)
 # =============================================================================
 
-@app.route('/camera/register/<int:camera_num>', methods=['POST'])
-def register_camera(camera_num):
-    """Cameras register their stream URL"""
+@app.route('/camera/push_frame/<int:camera_num>', methods=['POST'])
+def push_frame(camera_num):
+    """Cameras push video frames here"""
     if 1 <= camera_num <= 4:
-        data = request.get_json()
-        camera_streams[camera_num] = data.get('stream_url')
-        print(f"Camera {camera_num} registered: {camera_streams[camera_num]}")
-        return jsonify({'status': 'success', 'camera': camera_num}), 200
+        try:
+            # Get the frame data from the request
+            frame_data = request.data
+            
+            if frame_data:
+                camera_data = camera_frames[camera_num]
+                with camera_data['lock']:
+                    camera_data['frame'] = frame_data
+                    camera_data['last_update'] = time.time()
+                
+                return jsonify({'status': 'success'}), 200
+            else:
+                return jsonify({'status': 'error', 'message': 'No frame data'}), 400
+        except Exception as e:
+            print(f"Error receiving frame from camera {camera_num}: {e}")
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+    
     return jsonify({'status': 'error', 'message': 'Invalid camera number'}), 400
 
 
@@ -118,12 +128,6 @@ def get_alarm_status():
     return jsonify({'alarms': alarm_states}), 200
 
 
-@app.route('/api/camera_streams', methods=['GET'])
-def get_camera_streams():
-    """Get registered camera stream URLs"""
-    return jsonify({'streams': camera_streams}), 200
-
-
 @app.route('/api/trigger_alarm_<int:camera_num>', methods=['POST'])
 def api_trigger_alarm(camera_num):
     """Manual alarm trigger from website (optional)"""
@@ -169,26 +173,40 @@ def api_clear_all_alarms():
 
 
 # =============================================================================
-# VIDEO PROXY ENDPOINTS (Optional - if cameras can't expose public URLs)
+# VIDEO STREAMING ENDPOINTS
 # =============================================================================
 
 @app.route('/video_feed/<int:camera_num>')
 def video_feed(camera_num):
-    """Proxy video feed from camera to website"""
-    if 1 <= camera_num <= 4 and camera_streams[camera_num]:
-        try:
-            # Stream video from camera
-            def generate():
-                response = requests.get(camera_streams[camera_num], stream=True, timeout=10)
-                for chunk in response.iter_content(chunk_size=1024):
-                    yield chunk
+    """Stream the latest frames from camera buffer (MJPEG)"""
+    if 1 <= camera_num <= 4:
+        def generate():
+            camera_data = camera_frames[camera_num]
+            last_frame = None
             
-            return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
-        except Exception as e:
-            print(f"Error proxying video from camera {camera_num}: {e}")
-            return jsonify({'error': 'Camera not available'}), 503
+            while True:
+                with camera_data['lock']:
+                    current_frame = camera_data['frame']
+                    last_update = camera_data['last_update']
+                
+                # Check if we have a new frame
+                if current_frame and current_frame != last_frame:
+                    last_frame = current_frame
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + current_frame + b'\r\n')
+                else:
+                    # No new frame, check if camera is still alive
+                    if time.time() - last_update > 5:
+                        # Camera hasn't sent frames in 5 seconds
+                        # Could send a placeholder or just wait
+                        pass
+                
+                # Small delay to prevent busy waiting
+                time.sleep(0.033)  # ~30 FPS
+        
+        return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
     
-    return jsonify({'error': 'Invalid camera or not registered'}), 404
+    return jsonify({'error': 'Invalid camera number'}), 404
 
 
 # =============================================================================
@@ -202,12 +220,18 @@ def status():
     camera_status = {}
     
     for cam_num in alarm_states:
-        last_seen = current_time - alarm_states[cam_num]['last_update']
+        # Check both alarm state and frame updates
+        alarm_last_seen = current_time - alarm_states[cam_num]['last_update']
+        frame_last_seen = current_time - camera_frames[cam_num]['last_update']
+        
+        # Camera is online if we've seen either an alarm update or frame recently
+        last_seen = min(alarm_last_seen, frame_last_seen)
+        
         camera_status[cam_num] = {
             'online': last_seen < 30,  # Online if seen in last 30 seconds
             'alarm_active': alarm_states[cam_num]['active'],
             'last_seen_seconds_ago': round(last_seen, 1),
-            'stream_registered': camera_streams[cam_num] is not None
+            'has_frames': camera_frames[cam_num]['frame'] is not None
         }
     
     return jsonify({
@@ -221,10 +245,10 @@ def status():
 def index():
     """API documentation"""
     return """
-    <h1>Camera Relay Server</h1>
+    <h1>Camera Relay Server (Push-based Streaming)</h1>
     <h2>Camera Endpoints:</h2>
     <ul>
-        <li>POST /camera/register/&lt;camera_num&gt; - Register camera stream</li>
+        <li>POST /camera/push_frame/&lt;camera_num&gt; - Push video frame</li>
         <li>POST /camera/trigger_alarm/&lt;camera_num&gt; - Trigger alarm</li>
         <li>POST /camera/clear_alarm/&lt;camera_num&gt; - Clear alarm</li>
         <li>POST /camera/heartbeat/&lt;camera_num&gt; - Send heartbeat</li>
@@ -233,10 +257,12 @@ def index():
     <ul>
         <li>GET /api/commands - Poll for commands</li>
         <li>GET /api/alarm_status - Get all alarm states</li>
-        <li>GET /api/camera_streams - Get camera stream URLs</li>
-        <li>GET /video_feed/&lt;camera_num&gt; - Proxy video stream</li>
+        <li>GET /video_feed/&lt;camera_num&gt; - Stream video (MJPEG)</li>
         <li>GET /status - System status</li>
     </ul>
+    <h3>Note:</h3>
+    <p>This server uses push-based streaming. Cameras behind NAT/firewalls 
+    can push frames via HTTP POST without port forwarding.</p>
     """
 
 
@@ -252,7 +278,10 @@ def cleanup_task():
         
         for cam_num in alarm_states:
             # Auto-clear alarms if camera hasn't been seen in 60 seconds
-            last_seen = current_time - alarm_states[cam_num]['last_update']
+            alarm_last_seen = current_time - alarm_states[cam_num]['last_update']
+            frame_last_seen = current_time - camera_frames[cam_num]['last_update']
+            last_seen = min(alarm_last_seen, frame_last_seen)
+            
             if last_seen > 60 and alarm_states[cam_num]['active']:
                 print(f"Auto-clearing alarm for Camera {cam_num} (not seen for {last_seen:.0f}s)")
                 alarm_states[cam_num]['active'] = False
@@ -264,10 +293,10 @@ if __name__ == '__main__':
     cleanup_thread.start()
     
     print("\n" + "="*60)
-    print("Camera Relay Server Starting")
+    print("Camera Relay Server Starting (Push-based Streaming)")
     print("="*60)
-    print("This server bridges cameras and website across networks")
-    print("Deploy this on a cloud service with a public IP")
+    print("Cameras behind NAT/firewall push frames to this server")
+    print("No port forwarding required on camera networks")
     print("="*60 + "\n")
     
     # Run on all interfaces, port 5000
