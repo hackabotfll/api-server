@@ -23,7 +23,11 @@ alarm_states = {
     1: {'active': False, 'last_update': 0},
     2: {'active': False, 'last_update': 0},
     3: {'active': False, 'last_update': 0},
-    4: {'active': False, 'last_update': 0}
+    4: {'active': False, 'last_update': 0},
+    5: {'active': False, 'last_update': 0},
+    6: {'active': False, 'last_update': 0},
+    7: {'active': False, 'last_update': 0},
+    8: {'active': False, 'last_update': 0}
 }
 
 # Store latest video frames for each camera (in-memory buffer)
@@ -32,7 +36,11 @@ camera_frames = {
     1: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
     2: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
     3: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
-    4: {'frame': None, 'last_update': 0, 'lock': threading.Lock()}
+    4: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
+    5: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
+    6: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
+    7: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
+    8: {'frame': None, 'last_update': 0, 'lock': threading.Lock()}
 }
 
 # Latest command for polling
@@ -46,7 +54,7 @@ command_lock = threading.Lock()
 @app.route('/camera/push_frame/<int:camera_num>', methods=['POST'])
 def push_frame(camera_num):
     """Cameras push video frames here"""
-    if 1 <= camera_num <= 4:
+    if 1 <= camera_num <= 8:
         try:
             # Get the frame data from the request
             frame_data = request.data
@@ -71,7 +79,7 @@ def push_frame(camera_num):
 def camera_trigger_alarm(camera_num):
     """Cameras call this to trigger their alarm"""
     global latest_command
-    if 1 <= camera_num <= 4:
+    if 1 <= camera_num <= 8:
         alarm_states[camera_num]['active'] = True
         alarm_states[camera_num]['last_update'] = time.time()
         
@@ -87,7 +95,7 @@ def camera_trigger_alarm(camera_num):
 def camera_clear_alarm(camera_num):
     """Cameras call this to clear their alarm"""
     global latest_command
-    if 1 <= camera_num <= 4:
+    if 1 <= camera_num <= 8:
         alarm_states[camera_num]['active'] = False
         alarm_states[camera_num]['last_update'] = time.time()
         
@@ -102,7 +110,7 @@ def camera_clear_alarm(camera_num):
 @app.route('/camera/heartbeat/<int:camera_num>', methods=['POST'])
 def camera_heartbeat(camera_num):
     """Cameras send heartbeat to show they're online"""
-    if 1 <= camera_num <= 4:
+    if 1 <= camera_num <= 8:
         alarm_states[camera_num]['last_update'] = time.time()
         return jsonify({'status': 'success'}), 200
     return jsonify({'status': 'error'}), 400
@@ -132,7 +140,7 @@ def get_alarm_status():
 def api_trigger_alarm(camera_num):
     """Manual alarm trigger from website (optional)"""
     global latest_command
-    if 1 <= camera_num <= 4:
+    if 1 <= camera_num <= 8:
         alarm_states[camera_num]['active'] = True
         alarm_states[camera_num]['last_update'] = time.time()
         
@@ -147,7 +155,7 @@ def api_trigger_alarm(camera_num):
 def api_clear_alarm(camera_num):
     """Manual alarm clear from website (optional)"""
     global latest_command
-    if 1 <= camera_num <= 4:
+    if 1 <= camera_num <= 8:
         alarm_states[camera_num]['active'] = False
         alarm_states[camera_num]['last_update'] = time.time()
         
@@ -179,7 +187,7 @@ def api_clear_all_alarms():
 @app.route('/video_feed/<int:camera_num>')
 def video_feed(camera_num):
     """Stream the latest frames from camera buffer (MJPEG)"""
-    if 1 <= camera_num <= 4:
+    if 1 <= camera_num <= 8:
         def generate():
             camera_data = camera_frames[camera_num]
             last_frame = None
