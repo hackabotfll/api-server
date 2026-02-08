@@ -15,33 +15,34 @@ import time
 from collections import deque
 import threading
 
+# Configuration
+MAX_CAMERAS = 16
+AUTO_CLEAR_ALARM_TIMEOUT = 60
+CAMERA_ONLINE_THRESHOLD = 30
+HOST = '0.0.0.0'
+PORT = 5000
+DEBUG = False
+THREADED = True
+ENABLE_CORS = True
+CORS_ORIGINS = '*'
+CLEANUP_INTERVAL = 60
+MAX_FRAME_SIZE = 5 * 1024 * 1024
+FRAME_TIMEOUT = 5
+LOG_FRAME_RECEIVES = False
+LOG_HEARTBEATS = False
+
 app = Flask(__name__)
+
+# Configure CORS
 CORS(app)
 
-# Store alarm states for each camera
-alarm_states = {
-    1: {'active': False, 'last_update': 0},
-    2: {'active': False, 'last_update': 0},
-    3: {'active': False, 'last_update': 0},
-    4: {'active': False, 'last_update': 0},
-    5: {'active': False, 'last_update': 0},
-    6: {'active': False, 'last_update': 0},
-    7: {'active': False, 'last_update': 0},
-    8: {'active': False, 'last_update': 0}
-}
+# Dynamically create alarm states based on config
+alarm_states = {}
+camera_frames = {}
 
-# Store latest video frames for each camera (in-memory buffer)
-# Using deque with maxlen=1 to only keep the most recent frame
-camera_frames = {
-    1: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
-    2: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
-    3: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
-    4: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
-    5: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
-    6: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
-    7: {'frame': None, 'last_update': 0, 'lock': threading.Lock()},
-    8: {'frame': None, 'last_update': 0, 'lock': threading.Lock()}
-}
+for i in range(1, MAX_CAMERAS + 1):
+    alarm_states[i] = {'active': False, 'last_update': 0}
+    camera_frames[i] = {'frame': None, 'last_update': 0, 'lock': threading.Lock()}
 
 # Latest command for polling
 latest_command = None
@@ -54,16 +55,23 @@ command_lock = threading.Lock()
 @app.route('/camera/push_frame/<int:camera_num>', methods=['POST'])
 def push_frame(camera_num):
     """Cameras push video frames here"""
-    if 1 <= camera_num <= 8:
+    if 1 <= camera_num <= MAX_CAMERAS:
         try:
             # Get the frame data from the request
             frame_data = request.data
+            
+            # Check frame size
+            if len(frame_data) > MAX_FRAME_SIZE:
+                return jsonify({'status': 'error', 'message': 'Frame too large'}), 413
             
             if frame_data:
                 camera_data = camera_frames[camera_num]
                 with camera_data['lock']:
                     camera_data['frame'] = frame_data
                     camera_data['last_update'] = time.time()
+                
+                if LOG_FRAME_RECEIVES:
+                    print(f"Received frame from camera {camera_num} ({len(frame_data)} bytes)")
                 
                 return jsonify({'status': 'success'}), 200
             else:
@@ -72,14 +80,14 @@ def push_frame(camera_num):
             print(f"Error receiving frame from camera {camera_num}: {e}")
             return jsonify({'status': 'error', 'message': str(e)}), 500
     
-    return jsonify({'status': 'error', 'message': 'Invalid camera number'}), 400
+    return jsonify({'status': 'error', 'message': f'Invalid camera number (1-{MAX_CAMERAS})'}), 400
 
 
 @app.route('/camera/trigger_alarm/<int:camera_num>', methods=['POST'])
 def camera_trigger_alarm(camera_num):
     """Cameras call this to trigger their alarm"""
     global latest_command
-    if 1 <= camera_num <= 8:
+    if 1 <= camera_num <= MAX_CAMERAS:
         alarm_states[camera_num]['active'] = True
         alarm_states[camera_num]['last_update'] = time.time()
         
@@ -95,7 +103,7 @@ def camera_trigger_alarm(camera_num):
 def camera_clear_alarm(camera_num):
     """Cameras call this to clear their alarm"""
     global latest_command
-    if 1 <= camera_num <= 8:
+    if 1 <= camera_num <= MAX_CAMERAS:
         alarm_states[camera_num]['active'] = False
         alarm_states[camera_num]['last_update'] = time.time()
         
@@ -110,8 +118,10 @@ def camera_clear_alarm(camera_num):
 @app.route('/camera/heartbeat/<int:camera_num>', methods=['POST'])
 def camera_heartbeat(camera_num):
     """Cameras send heartbeat to show they're online"""
-    if 1 <= camera_num <= 8:
+    if 1 <= camera_num <= MAX_CAMERAS:
         alarm_states[camera_num]['last_update'] = time.time()
+        if LOG_HEARTBEATS:
+            print(f"❤️  Heartbeat from Camera {camera_num}")
         return jsonify({'status': 'success'}), 200
     return jsonify({'status': 'error'}), 400
 
@@ -140,7 +150,7 @@ def get_alarm_status():
 def api_trigger_alarm(camera_num):
     """Manual alarm trigger from website (optional)"""
     global latest_command
-    if 1 <= camera_num <= 8:
+    if 1 <= camera_num <= MAX_CAMERAS:
         alarm_states[camera_num]['active'] = True
         alarm_states[camera_num]['last_update'] = time.time()
         
@@ -155,7 +165,7 @@ def api_trigger_alarm(camera_num):
 def api_clear_alarm(camera_num):
     """Manual alarm clear from website (optional)"""
     global latest_command
-    if 1 <= camera_num <= 8:
+    if 1 <= camera_num <= MAX_CAMERAS:
         alarm_states[camera_num]['active'] = False
         alarm_states[camera_num]['last_update'] = time.time()
         
@@ -187,7 +197,7 @@ def api_clear_all_alarms():
 @app.route('/video_feed/<int:camera_num>')
 def video_feed(camera_num):
     """Stream the latest frames from camera buffer (MJPEG)"""
-    if 1 <= camera_num <= 8:
+    if 1 <= camera_num <= MAX_CAMERAS:
         def generate():
             camera_data = camera_frames[camera_num]
             last_frame = None
@@ -236,7 +246,7 @@ def status():
         last_seen = min(alarm_last_seen, frame_last_seen)
         
         camera_status[cam_num] = {
-            'online': last_seen < 30,  # Online if seen in last 30 seconds
+            'online': last_seen < CAMERA_ONLINE_THRESHOLD,
             'alarm_active': alarm_states[cam_num]['active'],
             'last_seen_seconds_ago': round(last_seen, 1),
             'has_frames': camera_frames[cam_num]['frame'] is not None
@@ -245,7 +255,8 @@ def status():
     return jsonify({
         'status': 'running',
         'cameras': camera_status,
-        'timestamp': current_time
+        'timestamp': current_time,
+        'max_cameras': MAX_CAMERAS
     }), 200
 
 
@@ -281,16 +292,16 @@ def index():
 def cleanup_task():
     """Periodically cleanup old camera states"""
     while True:
-        time.sleep(60)  # Run every minute
+        time.sleep(CLEANUP_INTERVAL)
         current_time = time.time()
         
         for cam_num in alarm_states:
-            # Auto-clear alarms if camera hasn't been seen in 60 seconds
+            # Auto-clear alarms if camera hasn't been seen in timeout period
             alarm_last_seen = current_time - alarm_states[cam_num]['last_update']
             frame_last_seen = current_time - camera_frames[cam_num]['last_update']
             last_seen = min(alarm_last_seen, frame_last_seen)
             
-            if last_seen > 60 and alarm_states[cam_num]['active']:
+            if last_seen > AUTO_CLEAR_ALARM_TIMEOUT and alarm_states[cam_num]['active']:
                 print(f"Auto-clearing alarm for Camera {cam_num} (not seen for {last_seen:.0f}s)")
                 alarm_states[cam_num]['active'] = False
 
@@ -305,7 +316,16 @@ if __name__ == '__main__':
     print("="*60)
     print("Cameras behind NAT/firewall push frames to this server")
     print("No port forwarding required on camera networks")
+    print("="*60)
+    print(f"Configuration:")
+    print(f"  Max Cameras: {MAX_CAMERAS}")
+    print(f"  Host: {HOST}")
+    print(f"  Port: {PORT}")
+    print(f"  CORS Enabled: {ENABLE_CORS}")
+    print(f"  Camera Online Threshold: {CAMERA_ONLINE_THRESHOLD}s")
+    print(f"  Auto-clear Timeout: {AUTO_CLEAR_ALARM_TIMEOUT}s")
+    print(f"  Cleanup Interval: {CLEANUP_INTERVAL}s")
     print("="*60 + "\n")
     
-    # Run on all interfaces, port 5000
-    app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)
+    # Run on all interfaces, port from config
+    app.run(host=HOST, port=PORT, threaded=THREADED, debug=DEBUG)
